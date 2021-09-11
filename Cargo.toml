@@ -21,3 +21,10 @@ tokio-stream = "0.1"
 [[bin]]
 name = "load_data"
 path = "bin/load_data.rs"
+
+[[bin]]
+name = "nyc_query"
+path = "bin/nyc_query.rs"
+
+[profile.release]
+debug = true

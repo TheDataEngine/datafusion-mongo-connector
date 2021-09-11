@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 
-const BATCH_SIZE: usize = 65536;
+const BATCH_SIZE: usize = 1024 * 1024;
 
 pub struct MongoSource {
     pub config: ReaderConfig,
@@ -52,6 +52,7 @@ impl TableProvider for MongoSource {
         limit: Option<usize>,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         let read_filters = write_filters(filters);
+        dbg!(&read_filters);
         // let handle = tokio::runtime::Handle::current();
         // let config_clone = self.config.clone();
         // let read_filters_clone = read_filters.clone();
@@ -106,40 +107,47 @@ impl TableProvider for MongoSource {
     }
 
     fn supports_filter_pushdown(&self, filter: &Expr) -> datafusion::error::Result<FPD> {
+        // return Ok(FPD::Unsupported);
         Ok(match filter {
             Expr::Alias(_, _) => FPD::Unsupported,
             Expr::Column(_) => FPD::Unsupported,
             Expr::ScalarVariable(_) => FPD::Unsupported,
             Expr::Literal(_) => FPD::Unsupported,
             Expr::BinaryExpr { op, left, right } => {
-                if let Expr::Column(_) = &**left {
-                    if let Expr::Literal(_) = &**right {
-                        match op {
-                            Operator::Eq => FPD::Exact,
-                            Operator::NotEq => FPD::Exact,
-                            Operator::Lt => FPD::Exact,
-                            Operator::LtEq => FPD::Exact,
-                            Operator::Gt => FPD::Exact,
-                            Operator::GtEq => FPD::Exact,
-                            Operator::Plus => FPD::Unsupported,
-                            Operator::Minus => FPD::Unsupported,
-                            Operator::Multiply => FPD::Unsupported,
-                            Operator::Divide => FPD::Unsupported,
-                            Operator::Modulo => FPD::Unsupported,
-                            Operator::And => FPD::Inexact,
-                            Operator::Or => FPD::Inexact,
-                            Operator::Like => FPD::Unsupported,
-                            Operator::NotLike => FPD::Unsupported,
-                            Operator::RegexMatch => FPD::Unsupported,
-                            Operator::RegexIMatch => FPD::Unsupported,
-                            Operator::RegexNotMatch => FPD::Unsupported,
-                            Operator::RegexNotIMatch => FPD::Unsupported,
+                match (&**left, &**right, op) {
+                    (Expr::Column(_), Expr::Literal(_), op) => {
+                        check_comparison_op(op)
+                    }
+                    (Expr::Column(_), Expr::BinaryExpr { ..}, op) => {
+                        // This could be a / (b + 1)
+                        let supports = self.supports_filter_pushdown(right)?;
+                        if supports == FPD::Unsupported {
+                            return Ok(supports);
                         }
-                    } else {
+                        check_comparison_op(op)
+                    }
+                    // Left is cast to a type, then compared with a literal
+                    (Expr::Cast { data_type, ..}, Expr::Literal(_), op) => {
+                        if to_aggregation_datatype(data_type).is_none() {
+                            return Ok(FPD::Unsupported);
+                        }
+                        // check if the datatype being cast to is supported?
+                        check_comparison_op(op)
+                    }
+                    (Expr::BinaryExpr { .. }, Expr::Literal(_), op) => {
+                        dbg!(&left);
+                        let supports = self.supports_filter_pushdown(left)?;
+                        if supports == FPD::Unsupported {
+                            return Ok(supports);
+                        }
+                        // An exact or inexact filter is supported, continue evaluating
+                        println!("test");
+                        check_comparison_op(op)
+                    }
+                    _ => {
+                        dbg!((left, right, op));
                         FPD::Unsupported
                     }
-                } else {
-                    FPD::Unsupported
                 }
             }
             Expr::Not(_) => FPD::Unsupported,
@@ -289,58 +297,50 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
         Expr::ScalarVariable(_) => todo!(),
         Expr::Literal(_) => todo!(),
         Expr::BinaryExpr { left, op, right } => {
-            if let Expr::Column(col) = &**left {
-                let col_name = col.flat_name();
-                if let Expr::Literal(scalar) = &**right {
-                    filters.push(match op {
-                        Operator::Eq => {
-                            doc! { "$match": {
-                                col_name: scalar_to_bson(scalar)
-                            }}
-                        }
-                        Operator::NotEq => doc! { "$match": {col_name: {
-                            "$ne": scalar_to_bson(scalar)
-                        }}},
-                        Operator::Lt => doc! {"$match": {
-                            col_name: {
-                                "$lt": scalar_to_bson(scalar)
-                            }
-                        }},
-                        Operator::LtEq => doc! {"$match": {
-                            col_name: {
-                                "$lte": scalar_to_bson(scalar)
-                            }
-                        }},
-                        Operator::Gt => doc! {"$match": {
-                            col_name: {
-                                "$gt": scalar_to_bson(scalar)
-                            }
-                        }},
-                        Operator::GtEq => doc! {"$match": {
-                            col_name: {
-                                "$gte": scalar_to_bson(scalar)
-                            }
-                        }},
-                        Operator::Plus => todo!(),
-                        Operator::Minus => todo!(),
-                        Operator::Multiply => todo!(),
-                        Operator::Divide => todo!(),
-                        Operator::Modulo => todo!(),
-                        Operator::And => todo!(),
-                        Operator::Or => todo!(),
-                        Operator::Like => todo!(),
-                        Operator::NotLike => todo!(),
-                        Operator::RegexMatch => todo!(),
-                        Operator::RegexIMatch => todo!(),
-                        Operator::RegexNotMatch => todo!(),
-                        Operator::RegexNotIMatch => todo!(),
-                    });
-                } else {
-                    todo!("right side should be literal")
+            match (&**left, &**right, op) {
+                (Expr::Column(col), Expr::Literal(scalar), op) => {
+                    let col_name = col.flat_name();
+                    filters.push(match_op_to_scalar(&col_name, op, scalar));
                 }
-            } else {
-                todo!("left expression has to be a column for now")
-            }
+                (Expr::Column(col), Expr::BinaryExpr { ..}, op) => {
+                    let col_name = col.flat_name();
+                    let left_bson = df_expr_to_bson(left);
+                    let right_bson = df_expr_to_bson(right);
+                    dbg!((col_name, left_bson, right_bson, op));
+                    todo!()
+                }
+                (Expr::BinaryExpr { .. }, Expr::Literal(scalar), op) => {
+                    let left_bson = df_expr_to_bson(left);
+                    filters.push(doc! {
+                        "$match": {
+                            "$expr": {
+                                op_to_str(op): [left_bson, scalar_to_bson(scalar)]
+                            }
+                        }
+                    });
+                }
+                (Expr::Cast { expr, data_type }, Expr::Literal(scalar), op) => {
+                    // Handle the cast and literal separately
+                    filters.push(doc! {
+                        "$addFields": {
+                            "convfield": {
+                                "$convert": {
+                                    "input": df_expr_to_bson(expr),
+                                    "to": to_aggregation_datatype(data_type).unwrap(),
+                                    "onError": Bson::Null
+                                }
+                            }
+                        }
+                    });
+                    // Add literal
+                    filters.push(match_op_to_scalar("convfield", op, scalar));
+                    // Remove the convfield
+                    filters.push(doc! { "$unset": "convfield" });
+                }
+                _ => {
+                    todo!("Incorrectly passed a filter that is not implemented for {:?}, {}, {:?}", left, op, right)
+                }
+            };
         }
         Expr::Not(_) => todo!(),
         Expr::IsNotNull(_) => todo!(),
@@ -350,10 +350,6 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
         Expr::Case { .. } => todo!(),
         Expr::Cast { .. } => {
             todo!()
-            // dbg!(&expr);
-            // filters.push(doc! { "$addFields": {"$convert": {
-            //     "input": data_type.to_string()
-            // } } });
         }
         Expr::TryCast { .. } => todo!(),
         Expr::Sort { .. } => todo!(),
@@ -367,6 +363,94 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
     });
 
     Some(filters)
+}
+
+fn to_aggregation_datatype(data_type: &DataType) -> Option<&str> {
+    match data_type {
+        DataType::Null => None,
+        DataType::Boolean => Some("bool"),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Some("int"),
+        DataType::Int64 | DataType::UInt64 => Some("long"),
+        DataType::Float16 => None,
+        DataType::Float32 | DataType::Float64 => Some("double"),
+        DataType::Timestamp(time_unit, _) if time_unit == &TimeUnit::Millisecond => Some("date"),
+        DataType::Date32 => None, // can't convert number of days, need millis
+        DataType::Date64 => Some("date"),
+        DataType::Time32(_) => None,
+        DataType::Time64(_) => None,
+        DataType::Duration(_) => None,
+        DataType::Interval(_) => None,
+        DataType::Binary => None,
+        DataType::FixedSizeBinary(_) => None,
+        DataType::LargeBinary => None,
+        DataType::Utf8 | DataType::LargeUtf8 => Some("string"),
+        DataType::List(_) => None,
+        DataType::FixedSizeList(_, _) => None,
+        DataType::LargeList(_) => None,
+        DataType::Struct(_) => None,
+        DataType::Union(_) => None,
+        DataType::Dictionary(_, _) => None,
+        DataType::Decimal(_, _) => Some("decimal"),
+        _ => None
+    }
+}
+
+fn df_expr_to_bson(expr: &Expr) -> Bson {
+    match expr {
+        Expr::Alias(_, _) => todo!(),
+        Expr::Column(col) => Bson::String(format!("${}", col.flat_name())),
+        Expr::ScalarVariable(_) => todo!(),
+        Expr::Literal(scalar) => scalar_to_bson(scalar),
+        Expr::BinaryExpr { left, op, right } => {
+            let op_fn = op_to_str(op);
+            Bson::Document(doc! {
+                op_fn: vec![df_expr_to_bson(left), df_expr_to_bson(right)]
+            })
+        },
+        Expr::Not(expr) => Bson::Document(doc! {
+            "$not": df_expr_to_bson(expr)
+        }),
+        Expr::IsNotNull(_) => todo!(),
+        Expr::IsNull(_) => todo!(),
+        Expr::Negative(_) => todo!(),
+        Expr::Between { .. } => todo!(),
+        Expr::Case { .. } => todo!(),
+        Expr::Cast { .. } => todo!(),
+        Expr::TryCast { .. } => todo!(),
+        Expr::Sort { .. } => todo!(),
+        Expr::ScalarFunction { .. } => todo!(),
+        Expr::ScalarUDF { .. } => todo!(),
+        Expr::AggregateFunction { .. } => todo!(),
+        Expr::WindowFunction { .. } => todo!(),
+        Expr::AggregateUDF { .. } => todo!(),
+        Expr::InList { .. } => todo!(),
+        Expr::Wildcard => todo!(),
+    }
+}
+
+#[inline]
+fn op_to_str(op: &Operator) -> &str {
+    match op {
+        Operator::Eq => "$eq",
+        Operator::NotEq => "$ne",
+        Operator::Lt => "$lt",
+        Operator::LtEq => "$lte",
+        Operator::Gt => "$gt",
+        Operator::GtEq => "$gte",
+        Operator::Plus => "$add",
+        Operator::Minus => "$subtract",
+        Operator::Multiply => "$multiply",
+        Operator::Divide => "$divide",
+        Operator::Modulo => "$mod",
+        Operator::And => "$and",
+        Operator::Or => "$or",
+        Operator::Like => todo!(),
+        Operator::NotLike => todo!(),
+        Operator::RegexMatch => todo!(),
+        Operator::RegexIMatch => todo!(),
+        Operator::RegexNotMatch => todo!(),
+        Operator::RegexNotIMatch => todo!(),
+    }
 }
 
 fn scalar_to_bson(scalar: &ScalarValue) -> Bson {
@@ -398,5 +482,76 @@ fn scalar_to_bson(scalar: &ScalarValue) -> Bson {
         ScalarValue::IntervalYearMonth(_) => todo!(),
         ScalarValue::IntervalDayTime(_) => todo!(),
         _ => Bson::Null,
+    }
+}
+
+fn match_op_to_scalar(col_name: &str, op: &Operator, scalar: &ScalarValue) -> Document {
+    match op {
+        Operator::Eq => {
+            doc! { "$match": {
+                col_name: scalar_to_bson(scalar)
+            }}
+        }
+        Operator::NotEq => doc! { "$match": {col_name: {
+            "$ne": scalar_to_bson(scalar)
+        }}},
+        Operator::Lt => doc! {"$match": {
+            col_name: {
+                "$lt": scalar_to_bson(scalar)
+            }
+        }},
+        Operator::LtEq => doc! {"$match": {
+            col_name: {
+                "$lte": scalar_to_bson(scalar)
+            }
+        }},
+        Operator::Gt => doc! {"$match": {
+            col_name: {
+                "$gt": scalar_to_bson(scalar)
+            }
+        }},
+        Operator::GtEq => doc! {"$match": {
+            col_name: {
+                "$gte": scalar_to_bson(scalar)
+            }
+        }},
+        Operator::Plus => todo!(),
+        Operator::Minus => todo!(),
+        Operator::Multiply => todo!(),
+        Operator::Divide => todo!(),
+        Operator::Modulo => todo!(),
+        Operator::And => todo!(),
+        Operator::Or => todo!(),
+        Operator::Like => todo!(),
+        Operator::NotLike => todo!(),
+        Operator::RegexMatch => todo!(),
+        Operator::RegexIMatch => todo!(),
+        Operator::RegexNotMatch => todo!(),
+        Operator::RegexNotIMatch => todo!(),
+    }
+}
+
+#[inline]
+fn check_comparison_op(op: &Operator) -> FPD {
+    match op {
+        Operator::Eq => FPD::Exact,
+        Operator::NotEq => FPD::Exact,
+        Operator::Lt => FPD::Exact,
+        Operator::LtEq => FPD::Exact,
+        Operator::Gt => FPD::Exact,
+        Operator::GtEq => FPD::Exact,
+        Operator::Plus => FPD::Exact,
+        Operator::Minus => FPD::Exact,
+        Operator::Multiply => FPD::Exact,
+        Operator::Divide => FPD::Exact,
+        Operator::Modulo => FPD::Unsupported,
+        Operator::And => FPD::Inexact,
+        Operator::Or => FPD::Inexact,
+        Operator::Like => FPD::Unsupported,
+        Operator::NotLike => FPD::Unsupported,
+        Operator::RegexMatch => FPD::Unsupported,
+        Operator::RegexIMatch => FPD::Unsupported,
+        Operator::RegexNotMatch => FPD::Unsupported,
+        Operator::RegexNotIMatch => FPD::Unsupported,
     }
 }
