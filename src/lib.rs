@@ -12,16 +12,15 @@ use datafusion::physical_plan::RecordBatchStream;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     datasource::{datasource::Statistics, TableProvider},
-    error::{DataFusionError, Result as DFResult},
+    error::{DataFusionError},
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
 use futures::Stream;
 use futures::StreamExt;
 use mongodb::bson::*;
-use mongodb_arrow_connector::reader::{Reader, ReaderConfig};
+use mongodb_arrow_connector::reader::{ReaderConfig};
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
-    task,
 };
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -53,12 +52,19 @@ impl TableProvider for MongoSource {
         limit: Option<usize>,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         let read_filters = write_filters(filters);
-        let num_records = Reader::estimate_records(
-            &self.config,
-            read_filters.clone().unwrap_or_default(),
-            Some(90000),
-        )
-        .unwrap();
+        // let handle = tokio::runtime::Handle::current();
+        // let config_clone = self.config.clone();
+        // let read_filters_clone = read_filters.clone();
+        // let future = async move {
+        //     Reader::estimate_records(
+        //         &config_clone,
+        //         read_filters_clone.unwrap_or_default(),
+        //         Some(90000),
+        //     )
+        //     .await
+        // };
+        // let num_records = handle.block_on(future).expect("Runtime error");
+        let num_records: Option<usize> = None;
         let partitions = if let Some(num_records) = num_records {
             let num_partitions = (num_records + BATCH_SIZE - 1) / BATCH_SIZE;
             println!(
@@ -119,11 +125,15 @@ impl TableProvider for MongoSource {
                             Operator::Minus => FPD::Unsupported,
                             Operator::Multiply => FPD::Unsupported,
                             Operator::Divide => FPD::Unsupported,
-                            Operator::Modulus => FPD::Unsupported,
+                            Operator::Modulo => FPD::Unsupported,
                             Operator::And => FPD::Inexact,
                             Operator::Or => FPD::Inexact,
                             Operator::Like => FPD::Unsupported,
                             Operator::NotLike => FPD::Unsupported,
+                            Operator::RegexMatch => FPD::Unsupported,
+                            Operator::RegexIMatch => FPD::Unsupported,
+                            Operator::RegexNotMatch => FPD::Unsupported,
+                            Operator::RegexNotIMatch => FPD::Unsupported,
                         }
                     } else {
                         FPD::Unsupported
@@ -225,63 +235,26 @@ impl ExecutionPlan for MongoExec {
         let partition = self.partitions.get(partition).unwrap().clone();
         let schema = self.schema();
 
-        task::spawn_blocking(move || {
-            if let Err(e) = read_data(partition, schema, response_tx) {
-                println!("MongoDB reader thread terminated due to error: {:?}", e);
+        tokio::task::spawn(async move {
+            let mut reader = mongodb_arrow_connector::reader::Reader::try_new(
+                &partition.config,
+                schema,
+                partition.filters.clone().unwrap_or_default(),
+                partition.limit,
+                partition.skip,
+            )
+            .unwrap();
+
+            while let Ok(Some(batch)) = reader.next_batch().await {
+                response_tx.send(Ok(batch)).await.expect("Unable to send"); // TODO: handle this error
             }
-        });
+        }).await.expect("Unable to spawn task"); // TODO: handle this error
+
         Ok(Box::pin(MongoStream {
             schema: self.schema(),
             inner: ReceiverStream::new(response_rx),
         }))
     }
-}
-
-fn read_data(
-    partition: MongoPartition,
-    schema: SchemaRef,
-    response_tx: Sender<ArrowResult<RecordBatch>>,
-) -> DFResult<()> {
-    let mut reader = mongodb_arrow_connector::reader::Reader::try_new(
-        &partition.config,
-        schema,
-        partition.filters.clone().unwrap_or_default(),
-        partition.limit,
-        partition.skip,
-    )
-    .unwrap(); // TODO: send error back
-
-    loop {
-        match reader.next() {
-            Some(Ok(batch)) => {
-                send_result(&response_tx, Ok(batch))?;
-            }
-            None => {
-                break;
-            }
-            Some(Err(e)) => {
-                send_result(&response_tx, Err(e))?;
-
-                // Terminate thread with error
-                return Err(DataFusionError::Execution(
-                    "Unable to read data from MongoDB".to_string(),
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn send_result(
-    response_tx: &Sender<ArrowResult<RecordBatch>>,
-    result: ArrowResult<RecordBatch>,
-) -> DFResult<()> {
-    // Note this function is running on its own blockng tokio thread so blocking here is ok.
-    response_tx
-        .blocking_send(result)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    Ok(())
 }
 
 struct MongoStream {
@@ -290,7 +263,7 @@ struct MongoStream {
 }
 
 impl Stream for MongoStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = datafusion::arrow::error::Result<datafusion::arrow::record_batch::RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.poll_next_unpin(cx)
@@ -309,14 +282,15 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
         return None;
     }
 
-    let mut filters = Vec::with_capacity(exprs.len());
+    let mut filters: Vec<Document> = Vec::with_capacity(exprs.len());
     exprs.iter().for_each(|expr| match expr {
         Expr::Alias(_, _) => todo!(),
         Expr::Column(_) => todo!(),
         Expr::ScalarVariable(_) => todo!(),
         Expr::Literal(_) => todo!(),
         Expr::BinaryExpr { left, op, right } => {
-            if let Expr::Column(col_name) = &**left {
+            if let Expr::Column(col) = &**left {
+                let col_name = col.flat_name();
                 if let Expr::Literal(scalar) = &**right {
                     filters.push(match op {
                         Operator::Eq => {
@@ -351,11 +325,15 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
                         Operator::Minus => todo!(),
                         Operator::Multiply => todo!(),
                         Operator::Divide => todo!(),
-                        Operator::Modulus => todo!(),
+                        Operator::Modulo => todo!(),
                         Operator::And => todo!(),
                         Operator::Or => todo!(),
                         Operator::Like => todo!(),
                         Operator::NotLike => todo!(),
+                        Operator::RegexMatch => todo!(),
+                        Operator::RegexIMatch => todo!(),
+                        Operator::RegexNotMatch => todo!(),
+                        Operator::RegexNotIMatch => todo!(),
                     });
                 } else {
                     todo!("right side should be literal")
@@ -412,7 +390,9 @@ fn scalar_to_bson(scalar: &ScalarValue) -> Bson {
         ScalarValue::Date32(_) => todo!(),
         ScalarValue::Date64(_) => todo!(),
         ScalarValue::TimestampSecond(_) => todo!(),
-        ScalarValue::TimestampMillisecond(_) => todo!(),
+        ScalarValue::TimestampMillisecond(Some(value)) => {
+            Bson::DateTime(mongodb::bson::DateTime::from_millis(*value))
+        }
         ScalarValue::TimestampMicrosecond(_) => todo!(),
         ScalarValue::TimestampNanosecond(_) => todo!(),
         ScalarValue::IntervalYearMonth(_) => todo!(),

@@ -31,10 +31,12 @@ async fn simple_query() {
 
     let mongo_nyc = MongoSource {
         config: ReaderConfig {
-            hostname: "localhost".to_string(),
+            hostname: "192.168.0.106".to_string(),
             port: Some(27018),
             database: "datafusion".to_string(),
             collection: "nyc_taxi".to_string(),
+            credential: None,
+            auth_db: None,
         },
         schema: nyc_schema.clone(),
     };

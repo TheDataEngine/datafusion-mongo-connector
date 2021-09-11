@@ -2,9 +2,9 @@ use std::{fs::File, path::PathBuf, process::Command, sync::Arc};
 
 use arrow::datatypes::*;
 use mongodb_arrow_connector::writer::*;
-use rayon::prelude::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     Command::new("wget")
         .args(&[
             "https://s3.amazonaws.com/nyc-tlc/trip+data/yellow_tripdata_2019-01.csv",
@@ -47,57 +47,28 @@ fn main() {
         })
         .collect();
 
-    paths.par_iter().for_each(|path| {
+    for path in paths {
         println!("Writing data for {:?}", path);
         let file = File::open(path).unwrap();
         let mut csv_reader =
             arrow::csv::Reader::new(file, csv_schema.clone(), true, Some(b','), 8196, None, None);
 
         let writer_config = WriterConfig {
-            hostname: "localhost",
+            hostname: "localhost".to_string(),
             port: Some(27018),
-            database: "datafusion",
-            collection: "nyc_taxi",
+            database: "datafusion".to_string(),
+            collection: "nyc_taxi".to_string(),
+            credential: None,
+            auth_db: None,
             write_mode: WriteMode::Append,
             coerce_types: true,
         };
-        let mongo_writer = Writer::try_new(&writer_config, csv_schema.as_ref().clone()).unwrap();
+        let mongo_writer = Writer::try_new(writer_config, csv_schema.as_ref().clone())
+            .await
+            .unwrap();
         while let Some(Ok(batch)) = csv_reader.next() {
             println!("-");
-            mongo_writer.write(&batch).unwrap();
+            mongo_writer.write(&batch).await.unwrap();
         }
-    });
-
-    // std::fs::read_dir("C:/Users/nevi/Documents/nyc-data").unwrap().for_each(|p| {
-    //     let p = p.unwrap();
-    //     let file_name = p.file_name();
-    //     if file_name.to_str().unwrap().ends_with(".csv") {
-    //         println!("Writing data for {:?}", file_name);
-    //         let file = File::open(p.path()).unwrap();
-    //         let mut csv_reader = arrow::csv::Reader::new(
-    //             file,
-    //             csv_schema.clone(),
-    //             true,
-    //             Some(b','),
-    //             65536 / 2,
-    //             None,
-    //             None,
-    //         );
-
-    //         let writer_config = WriterConfig {
-    //             hostname: "localhost",
-    //             port: Some(27018),
-    //             database: "datafusion",
-    //             collection: "nyc_taxi",
-    //             write_mode: WriteMode::Overwrite,
-    //             coerce_types: true,
-    //         };
-    //         let mongo_writer =
-    //             Writer::try_new(&writer_config, csv_schema.as_ref().clone()).unwrap();
-    //         while let Some(Ok(batch)) = csv_reader.next() {
-    //             println!("-");
-    //             mongo_writer.write(&batch).unwrap();
-    //         }
-    //     }
-    // });
+    }
 }
