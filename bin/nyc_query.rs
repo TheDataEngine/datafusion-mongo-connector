@@ -63,7 +63,7 @@ async fn main() {
         .sql(
             "select 
             count(*) as total_records,
-            payment_type,
+            VendorID as vid,
             sum(cast(trip_distance as float)) as total_distance
             from mongo_nyc
             where 
@@ -71,8 +71,11 @@ async fn main() {
                 cast(trip_distance as float) < 5.00 and
                 fare_amount / (total_amount + 0.001) > 0.70 and
                 total_amount < 20.0
-            group by payment_type
-            order by payment_type
+                and passenger_count is not null
+                and -passenger_count < -2
+                and VendorID in ('2', '4')
+            group by VendorID
+            order by vid
             limit 100",
         )
         .unwrap();

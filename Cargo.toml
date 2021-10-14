@@ -6,17 +6,12 @@ edition = "2018"
 [dependencies]
 mongodb = { version = "2.0" }
 datafusion = { git = "https://github.com/apache/arrow-datafusion" }
-arrow = { version = "5", features = ["prettyprint"] }
-mongodb-arrow-connector = { version = "0.4", path = "../mongodb-arrow-connector" }
+arrow = { version = "5", default-features = false, features = ["prettyprint"] }
+mongodb-arrow-connector = { version = "0.4" }
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1"
-
-# [dev-dependencies]
-# console-subscriber = { git = "https://github.com/tokio-rs/console" }
-# tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync", "tracing"] }
-# tracing = "0.1"
 
 [[bin]]
 name = "load_data"

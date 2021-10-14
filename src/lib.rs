@@ -8,29 +8,26 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::datasource::datasource::TableProviderFilterPushDown as FPD;
 use datafusion::logical_plan::{Expr, Operator};
-use datafusion::physical_plan::RecordBatchStream;
+use datafusion::physical_plan::{RecordBatchStream, Statistics};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
-    datasource::{datasource::Statistics, TableProvider},
-    error::{DataFusionError},
+    datasource::TableProvider,
+    error::DataFusionError,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
 use futures::Stream;
 use futures::StreamExt;
 use mongodb::bson::*;
-use mongodb_arrow_connector::reader::{ReaderConfig};
-use tokio::{
-    sync::mpsc::{channel, Receiver, Sender},
-};
+use mongodb_arrow_connector::reader::{Reader, ReaderConfig};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
-
-const BATCH_SIZE: usize = 1024 * 1024;
 
 pub struct MongoSource {
     pub config: ReaderConfig,
     pub schema: SchemaRef,
 }
 
+#[async_trait]
 impl TableProvider for MongoSource {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -40,7 +37,7 @@ impl TableProvider for MongoSource {
         self.schema.clone()
     }
 
-    fn scan(
+    async fn scan(
         &self,
         projection: &Option<Vec<usize>>,
         batch_size: usize,
@@ -52,39 +49,33 @@ impl TableProvider for MongoSource {
         limit: Option<usize>,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         let read_filters = write_filters(filters);
-        dbg!(&read_filters);
-        // let handle = tokio::runtime::Handle::current();
-        // let config_clone = self.config.clone();
-        // let read_filters_clone = read_filters.clone();
-        // let future = async move {
-        //     Reader::estimate_records(
-        //         &config_clone,
-        //         read_filters_clone.unwrap_or_default(),
-        //         Some(90000),
-        //     )
-        //     .await
-        // };
-        // let num_records = handle.block_on(future).expect("Runtime error");
-        let num_records: Option<usize> = None;
+        let num_records = Reader::estimate_records(
+            &self.config,
+            read_filters.clone().unwrap_or_default(),
+            Some(1000),
+        )
+        .await?;
         let partitions = if let Some(num_records) = num_records {
-            let num_partitions = (num_records + BATCH_SIZE - 1) / BATCH_SIZE;
-            println!(
-                "There are {} partitions with {:?} batch per partition",
-                num_partitions, batch_size
-            );
+            let partition_limit = limit.unwrap_or(num_records);
+            let num_records = num_records.min(partition_limit);
+            let num_partitions = (num_records + batch_size - 1) / batch_size;
+            // println!(
+            //     "There are {} partitions with {:?} batch per partition",
+            //     num_partitions, batch_size
+            // );
             (0..=num_partitions)
                 .map(|p| MongoPartition {
                     config: self.config.clone(),
                     filters: read_filters.clone(),
-                    limit: Some(BATCH_SIZE),
-                    skip: Some(p * BATCH_SIZE),
+                    limit: Some(batch_size),
+                    skip: Some(p * batch_size),
                 })
                 .collect()
         } else {
             vec![MongoPartition {
                 config: self.config.clone(),
                 filters: write_filters(filters),
-                limit: None,
+                limit,
                 skip: None,
             }]
         };
@@ -99,26 +90,19 @@ impl TableProvider for MongoSource {
             } else {
                 self.schema()
             },
-            projection: projection.clone().unwrap(),
-            batch_size,
-            statistics: Statistics::default(),
-            limit,
         }))
     }
 
     fn supports_filter_pushdown(&self, filter: &Expr) -> datafusion::error::Result<FPD> {
-        // return Ok(FPD::Unsupported);
-        Ok(match filter {
+        let supported = match filter {
             Expr::Alias(_, _) => FPD::Unsupported,
             Expr::Column(_) => FPD::Unsupported,
             Expr::ScalarVariable(_) => FPD::Unsupported,
             Expr::Literal(_) => FPD::Unsupported,
             Expr::BinaryExpr { op, left, right } => {
                 match (&**left, &**right, op) {
-                    (Expr::Column(_), Expr::Literal(_), op) => {
-                        check_comparison_op(op)
-                    }
-                    (Expr::Column(_), Expr::BinaryExpr { ..}, op) => {
+                    (Expr::Column(_), Expr::Literal(_), op) => check_comparison_op(op),
+                    (Expr::Column(_), Expr::BinaryExpr { .. }, op) => {
                         // This could be a / (b + 1)
                         let supports = self.supports_filter_pushdown(right)?;
                         if supports == FPD::Unsupported {
@@ -127,7 +111,7 @@ impl TableProvider for MongoSource {
                         check_comparison_op(op)
                     }
                     // Left is cast to a type, then compared with a literal
-                    (Expr::Cast { data_type, ..}, Expr::Literal(_), op) => {
+                    (Expr::Cast { data_type, .. }, Expr::Literal(_), op) => {
                         if to_aggregation_datatype(data_type).is_none() {
                             return Ok(FPD::Unsupported);
                         }
@@ -135,24 +119,28 @@ impl TableProvider for MongoSource {
                         check_comparison_op(op)
                     }
                     (Expr::BinaryExpr { .. }, Expr::Literal(_), op) => {
-                        dbg!(&left);
                         let supports = self.supports_filter_pushdown(left)?;
                         if supports == FPD::Unsupported {
                             return Ok(supports);
                         }
                         // An exact or inexact filter is supported, continue evaluating
-                        println!("test");
                         check_comparison_op(op)
                     }
                     _ => {
-                        dbg!((left, right, op));
+                        // dbg!((left, right, op));
                         FPD::Unsupported
                     }
                 }
             }
-            Expr::Not(_) => FPD::Unsupported,
-            Expr::IsNotNull(_) => FPD::Unsupported,
-            Expr::IsNull(_) => FPD::Unsupported,
+            Expr::Not(expr) => self.supports_filter_pushdown(expr)?,
+            Expr::IsNotNull(expr) => match **expr {
+                Expr::Column(_) => FPD::Exact,
+                _ => self.supports_filter_pushdown(expr)?,
+            },
+            Expr::IsNull(expr) => match **expr {
+                Expr::Column(_) => FPD::Exact,
+                _ => self.supports_filter_pushdown(expr)?,
+            },
             Expr::Negative(_) => FPD::Unsupported,
             Expr::Between { .. } => FPD::Unsupported,
             Expr::Case { .. } => FPD::Unsupported,
@@ -163,14 +151,23 @@ impl TableProvider for MongoSource {
             Expr::ScalarUDF { .. } => FPD::Unsupported,
             Expr::AggregateFunction { .. } => FPD::Unsupported,
             Expr::AggregateUDF { .. } => FPD::Unsupported,
-            Expr::InList { .. } => FPD::Unsupported,
+            Expr::InList { negated, .. } => {
+                if *negated {
+                    FPD::Unsupported
+                } else {
+                    // TODO: regex match not supported
+                    FPD::Exact
+                }
+            }
             Expr::Wildcard => FPD::Unsupported,
             Expr::WindowFunction { .. } => FPD::Unsupported,
-        })
-    }
+        };
 
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
+        if supported == FPD::Unsupported {
+            dbg!(filter);
+        }
+
+        Ok(supported)
     }
 }
 
@@ -180,14 +177,6 @@ pub struct MongoExec {
     partitions: Vec<MongoPartition>,
     /// Schema after projection is applied
     schema: SchemaRef,
-    /// Projection for which columns to load
-    projection: Vec<usize>,
-    /// Batch size
-    batch_size: usize,
-    /// Statistics for the data set (sum of statistics for all partitions)
-    statistics: Statistics,
-    /// Optional limit of the number of rows
-    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,14 +243,25 @@ impl ExecutionPlan for MongoExec {
             .unwrap();
 
             while let Ok(Some(batch)) = reader.next_batch().await {
+                println!(
+                    "Record batch has {} records and {} columns",
+                    batch.num_rows(),
+                    batch.num_columns()
+                );
                 response_tx.send(Ok(batch)).await.expect("Unable to send"); // TODO: handle this error
             }
-        }).await.expect("Unable to spawn task"); // TODO: handle this error
+        })
+        .await
+        .expect("Unable to spawn task"); // TODO: handle this error
 
         Ok(Box::pin(MongoStream {
             schema: self.schema(),
             inner: ReceiverStream::new(response_rx),
         }))
+    }
+
+    fn statistics(&self) -> Statistics {
+        Statistics::default()
     }
 }
 
@@ -302,7 +302,7 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
                     let col_name = col.flat_name();
                     filters.push(match_op_to_scalar(&col_name, op, scalar));
                 }
-                (Expr::Column(col), Expr::BinaryExpr { ..}, op) => {
+                (Expr::Column(col), Expr::BinaryExpr { .. }, op) => {
                     let col_name = col.flat_name();
                     let left_bson = df_expr_to_bson(left);
                     let right_bson = df_expr_to_bson(right);
@@ -338,13 +338,34 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
                     filters.push(doc! { "$unset": "convfield" });
                 }
                 _ => {
-                    todo!("Incorrectly passed a filter that is not implemented for {:?}, {}, {:?}", left, op, right)
+                    panic!(
+                        "Incorrectly passed a filter that is not implemented for {:?}, {}, {:?}",
+                        left, op, right
+                    )
                 }
             };
         }
-        Expr::Not(_) => todo!(),
-        Expr::IsNotNull(_) => todo!(),
-        Expr::IsNull(_) => todo!(),
+        Expr::Not(expr) => filters.push(doc! {
+            "$match": {
+                "$expr": {
+                    "$not": [df_expr_to_bson(expr)]
+                }
+            }
+        }),
+        Expr::IsNotNull(expr) => filters.push(doc! {
+            "$match": {
+                "$expr": {
+                    "$ne": [df_expr_to_bson(expr), Bson::Null]
+                }
+            }
+        }),
+        Expr::IsNull(expr) => filters.push(doc! {
+            "$match": {
+                "$expr": {
+                    "$eq": [df_expr_to_bson(expr), Bson::Null]
+                }
+            }
+        }),
         Expr::Negative(_) => todo!(),
         Expr::Between { .. } => todo!(),
         Expr::Case { .. } => todo!(),
@@ -357,7 +378,16 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
         Expr::ScalarUDF { .. } => todo!(),
         Expr::AggregateFunction { .. } => todo!(),
         Expr::AggregateUDF { .. } => todo!(),
-        Expr::InList { .. } => todo!(),
+        Expr::InList { expr, list, .. } => {
+            let list = list.iter().map(df_expr_to_bson).collect::<Vec<_>>();
+            filters.push(doc! {
+                "$match": {
+                    "$expr": {
+                        "$in": [df_expr_to_bson(expr), list]
+                    }
+                }
+            });
+        }
         Expr::Wildcard => todo!(),
         Expr::WindowFunction { .. } => todo!(),
     });
@@ -369,7 +399,12 @@ fn to_aggregation_datatype(data_type: &DataType) -> Option<&str> {
     match data_type {
         DataType::Null => None,
         DataType::Boolean => Some("bool"),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Some("int"),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => Some("int"),
         DataType::Int64 | DataType::UInt64 => Some("long"),
         DataType::Float16 => None,
         DataType::Float32 | DataType::Float64 => Some("double"),
@@ -391,7 +426,7 @@ fn to_aggregation_datatype(data_type: &DataType) -> Option<&str> {
         DataType::Union(_) => None,
         DataType::Dictionary(_, _) => None,
         DataType::Decimal(_, _) => Some("decimal"),
-        _ => None
+        _ => None,
     }
 }
 
@@ -406,12 +441,16 @@ fn df_expr_to_bson(expr: &Expr) -> Bson {
             Bson::Document(doc! {
                 op_fn: vec![df_expr_to_bson(left), df_expr_to_bson(right)]
             })
-        },
+        }
         Expr::Not(expr) => Bson::Document(doc! {
             "$not": df_expr_to_bson(expr)
         }),
-        Expr::IsNotNull(_) => todo!(),
-        Expr::IsNull(_) => todo!(),
+        Expr::IsNotNull(_) => Bson::Document(doc! {
+            "$ne": [df_expr_to_bson(expr), Bson::Null]
+        }),
+        Expr::IsNull(expr) => Bson::Document(doc! {
+            "$eq": [df_expr_to_bson(expr), Bson::Null]
+        }),
         Expr::Negative(_) => todo!(),
         Expr::Between { .. } => todo!(),
         Expr::Case { .. } => todo!(),
