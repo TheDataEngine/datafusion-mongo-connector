@@ -161,6 +161,7 @@ impl TableProvider for MongoSource {
             }
             Expr::Wildcard => FPD::Unsupported,
             Expr::WindowFunction { .. } => FPD::Unsupported,
+            Expr::GetIndexedField { .. } => FPD::Unsupported,
         };
 
         if supported == FPD::Unsupported {
@@ -390,6 +391,7 @@ fn write_filters(exprs: &[Expr]) -> Option<Vec<Document>> {
         }
         Expr::Wildcard => todo!(),
         Expr::WindowFunction { .. } => todo!(),
+        Expr::GetIndexedField { .. } => todo!(),
     });
 
     Some(filters)
@@ -464,6 +466,7 @@ fn df_expr_to_bson(expr: &Expr) -> Bson {
         Expr::AggregateUDF { .. } => todo!(),
         Expr::InList { .. } => todo!(),
         Expr::Wildcard => todo!(),
+        Expr::GetIndexedField { .. } => todo!(),
     }
 }
 
@@ -489,6 +492,8 @@ fn op_to_str(op: &Operator) -> &str {
         Operator::RegexIMatch => todo!(),
         Operator::RegexNotMatch => todo!(),
         Operator::RegexNotIMatch => todo!(),
+        Operator::IsDistinctFrom => todo!(),
+        Operator::IsNotDistinctFrom => todo!(),
     }
 }
 
@@ -512,12 +517,12 @@ fn scalar_to_bson(scalar: &ScalarValue) -> Bson {
         ScalarValue::List(_, _) => todo!(),
         ScalarValue::Date32(_) => todo!(),
         ScalarValue::Date64(_) => todo!(),
-        ScalarValue::TimestampSecond(_) => todo!(),
-        ScalarValue::TimestampMillisecond(Some(value)) => {
+        ScalarValue::TimestampSecond(_, _) => todo!(),
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
             Bson::DateTime(mongodb::bson::DateTime::from_millis(*value))
         }
-        ScalarValue::TimestampMicrosecond(_) => todo!(),
-        ScalarValue::TimestampNanosecond(_) => todo!(),
+        ScalarValue::TimestampMicrosecond(_, _) => todo!(),
+        ScalarValue::TimestampNanosecond(_, _) => todo!(),
         ScalarValue::IntervalYearMonth(_) => todo!(),
         ScalarValue::IntervalDayTime(_) => todo!(),
         _ => Bson::Null,
@@ -567,6 +572,8 @@ fn match_op_to_scalar(col_name: &str, op: &Operator, scalar: &ScalarValue) -> Do
         Operator::RegexIMatch => todo!(),
         Operator::RegexNotMatch => todo!(),
         Operator::RegexNotIMatch => todo!(),
+        Operator::IsDistinctFrom => todo!(),
+        Operator::IsNotDistinctFrom => todo!(),
     }
 }
 
@@ -592,5 +599,7 @@ fn check_comparison_op(op: &Operator) -> FPD {
         Operator::RegexIMatch => FPD::Unsupported,
         Operator::RegexNotMatch => FPD::Unsupported,
         Operator::RegexNotIMatch => FPD::Unsupported,
+        Operator::IsDistinctFrom => FPD::Unsupported,
+        Operator::IsNotDistinctFrom => FPD::Unsupported,
     }
 }

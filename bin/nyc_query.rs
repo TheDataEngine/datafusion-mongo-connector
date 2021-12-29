@@ -78,6 +78,7 @@ async fn main() {
             order by vid
             limit 100",
         )
+        .await
         .unwrap();
     let logical_plan = df.to_logical_plan();
     dbg!(&logical_plan);

@@ -56,6 +56,7 @@ async fn simple_query() {
                 file_extension: "csv",
             },
         )
+        .await
         .unwrap();
 
     let df = context
@@ -72,6 +73,7 @@ async fn simple_query() {
                 total_amount < 20.0
             limit 100",
         )
+        .await
         .unwrap();
     let logical_plan = df.to_logical_plan();
     dbg!(&logical_plan);
